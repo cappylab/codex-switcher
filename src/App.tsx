@@ -3,17 +3,32 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useAccounts } from "./hooks/useAccounts";
 import { AccountCard, AddAccountModal, UpdateChecker } from "./components";
 import type { CodexProcessInfo } from "./types";
+import type { AccountSortMode } from "./lib/accountOrdering";
+import { isUsageExhausted, sortAccountsForDisplay } from "./lib/accountOrdering";
 import {
   exportFullBackupFile,
   importFullBackupFile,
   isTauriRuntime,
   invokeBackend,
 } from "./lib/platform";
+import {
+  BoltIcon,
+  CheckIcon,
+  ChevronDownIcon,
+  CloseIcon,
+  EyeIcon,
+  EyeOffIcon,
+  MenuIcon,
+  MoonIcon,
+  RefreshIcon,
+  SunIcon,
+  UserIcon,
+} from "./components/Icons";
 import "./App.css";
 
 const THEME_STORAGE_KEY = "codex-switcher-theme";
 type ThemeMode = "light" | "dark";
-const appWindow = getCurrentWindow();
+const appWindow = isTauriRuntime() ? getCurrentWindow() : null;
 const isMacOs =
   typeof navigator !== "undefined" &&
   /(Mac|iPhone|iPod|iPad)/i.test(navigator.userAgent);
@@ -29,6 +44,7 @@ function App() {
     warmupAccount,
     warmupAllAccounts,
     switchAccount,
+    autoSwitchAccountForUsage,
     deleteAccount,
     renameAccount,
     importFromFile,
@@ -65,16 +81,11 @@ function App() {
     isError: boolean;
   } | null>(null);
   const [maskedAccounts, setMaskedAccounts] = useState<Set<string>>(new Set());
-  const [otherAccountsSort, setOtherAccountsSort] = useState<
-    | "deadline_asc"
-    | "deadline_desc"
-    | "remaining_desc"
-    | "remaining_asc"
-    | "subscription_asc"
-    | "subscription_desc"
-  >("deadline_asc");
+  const [accountSort, setAccountSort] = useState<AccountSortMode>("deadline_asc");
   const [isActionsMenuOpen, setIsActionsMenuOpen] = useState(false);
   const actionsMenuRef = useRef<HTMLDivElement | null>(null);
+  const autoSwitchInFlightRef = useRef(false);
+  const lastAutoSwitchKeyRef = useRef<string | null>(null);
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
     if (typeof window === "undefined") return "light";
     try {
@@ -89,14 +100,14 @@ function App() {
   const handleTitlebarDrag = useCallback(
     (event: React.MouseEvent<HTMLDivElement>) => {
       if (!isTauriRuntime() || event.button !== 0) return;
-      void appWindow.startDragging();
+      void appWindow?.startDragging();
     },
     []
   );
 
   const handleTitlebarDoubleClick = useCallback(() => {
     if (!isTauriRuntime()) return;
-    void appWindow.toggleMaximize();
+    void appWindow?.toggleMaximize();
   }, []);
 
   const toggleMask = (accountId: string) => {
@@ -194,7 +205,7 @@ function App() {
 
     const syncMaximizedState = async () => {
       try {
-        setIsWindowMaximized(await appWindow.isMaximized());
+        setIsWindowMaximized((await appWindow?.isMaximized()) ?? false);
       } catch (err) {
         console.error("Failed to read window state:", err);
       }
@@ -203,7 +214,7 @@ function App() {
     void syncMaximizedState();
 
     appWindow
-      .onResized(() => {
+      ?.onResized(() => {
         void syncMaximizedState();
       })
       .then((fn) => {
@@ -219,15 +230,10 @@ function App() {
   }, []);
 
   const handleSwitch = async (accountId: string) => {
-    // Check processes before switching
-    const latestProcessInfo = await checkProcesses();
-    if (latestProcessInfo && !latestProcessInfo.can_switch) {
-      return;
-    }
-
     try {
       setSwitchingId(accountId);
       await switchAccount(accountId);
+      await checkProcesses();
     } catch (err) {
       console.error("Failed to switch account:", err);
     } finally {
@@ -266,6 +272,47 @@ function App() {
     setWarmupToast({ message, isError });
     setTimeout(() => setWarmupToast(null), 2500);
   };
+
+  useEffect(() => {
+    if (accounts.length < 2 || autoSwitchInFlightRef.current) return;
+    if (accounts.some((account) => account.usageLoading || !account.usage)) return;
+    if (!accounts.some((account) => account.is_active)) return;
+
+    const key = accounts
+      .map((account) => {
+        const usage = account.usage;
+        return [
+          account.id,
+          account.is_active ? "active" : "other",
+          usage?.primary_used_percent ?? "n",
+          usage?.secondary_used_percent ?? "n",
+          usage?.has_credits ?? "n",
+          usage?.unlimited_credits ?? "n",
+          usage?.error ?? "",
+        ].join(":");
+      })
+      .join("|");
+
+    if (lastAutoSwitchKeyRef.current === key) return;
+    lastAutoSwitchKeyRef.current = key;
+    autoSwitchInFlightRef.current = true;
+
+    const usages = accounts.map((account) => account.usage!);
+    autoSwitchAccountForUsage(usages)
+      .then((switched) => {
+        if (switched) {
+          showWarmupToast(`Auto-switched to ${switched.name}`);
+          void checkProcesses();
+        }
+      })
+      .catch((err) => {
+        console.error("Failed to auto-switch account:", err);
+        lastAutoSwitchKeyRef.current = null;
+      })
+      .finally(() => {
+        autoSwitchInFlightRef.current = false;
+      });
+  }, [accounts, autoSwitchAccountForUsage, checkProcesses]);
 
   const formatWarmupError = (err: unknown) => {
     if (!err) return "Unknown error";
@@ -353,6 +400,22 @@ function App() {
     setIsConfigModalOpen(true);
   };
 
+  const requestFullBackupPassphrase = (mode: "export" | "import") => {
+    const promptText =
+      mode === "export"
+        ? "Enter a passphrase for this full backup. You will need it to import the file later. Minimum 12 characters."
+        : "Enter the passphrase used for this full backup. Minimum 12 characters.";
+    const passphrase = window.prompt(promptText);
+    if (passphrase === null) return null;
+
+    if (passphrase.trim().length < 12) {
+      showWarmupToast("Passphrase must be at least 12 characters.", true);
+      return null;
+    }
+
+    return passphrase;
+  };
+
   const handleImportSlimText = async () => {
     if (!configPayload.trim()) {
       setConfigModalError("Please paste the slim text string first.");
@@ -379,9 +442,12 @@ function App() {
   };
 
   const handleExportFullFile = async () => {
+    const passphrase = requestFullBackupPassphrase("export");
+    if (!passphrase) return;
+
     try {
       setIsExportingFull(true);
-      const exported = await exportFullBackupFile();
+      const exported = await exportFullBackupFile(passphrase);
       if (!exported) return;
       showWarmupToast("Full encrypted file exported.");
     } catch (err) {
@@ -393,9 +459,12 @@ function App() {
   };
 
   const handleImportFullFile = async () => {
+    const passphrase = requestFullBackupPassphrase("import");
+    if (!passphrase) return;
+
     try {
       setIsImportingFull(true);
-      const summary = await importFullBackupFile();
+      const summary = await importFullBackupFile(passphrase);
       if (!summary) return;
       const accountList = await loadAccounts();
       await refreshUsage(accountList);
@@ -412,110 +481,30 @@ function App() {
     }
   };
 
-  const activeAccount = accounts.find((a) => a.is_active);
-  const otherAccounts = accounts.filter((a) => !a.is_active);
   const hasRunningProcesses = processInfo && processInfo.count > 0;
-
-  const sortedOtherAccounts = useMemo(() => {
-    const getResetDeadline = (resetAt: number | null | undefined) =>
-      resetAt ?? Number.POSITIVE_INFINITY;
-
-    const getSubscriptionDeadline = (expiresAt: string | null | undefined) => {
-      if (!expiresAt) return null;
-      const timestamp = new Date(expiresAt).getTime();
-      return Number.isNaN(timestamp) ? null : timestamp;
-    };
-
-    const compareOptionalNumber = (
-      aValue: number | null,
-      bValue: number | null,
-      direction: "asc" | "desc"
-    ) => {
-      if (aValue === null && bValue === null) return 0;
-      if (aValue === null) return 1;
-      if (bValue === null) return -1;
-      return direction === "asc" ? aValue - bValue : bValue - aValue;
-    };
-
-    const getRemainingPercent = (usedPercent: number | null | undefined) => {
-      if (usedPercent === null || usedPercent === undefined) {
-        return Number.NEGATIVE_INFINITY;
-      }
-      return Math.max(0, 100 - usedPercent);
-    };
-
-    return [...otherAccounts].sort((a, b) => {
-      if (
-        otherAccountsSort === "subscription_asc" ||
-        otherAccountsSort === "subscription_desc"
-      ) {
-        const subscriptionDiff = compareOptionalNumber(
-          getSubscriptionDeadline(a.subscription_expires_at),
-          getSubscriptionDeadline(b.subscription_expires_at),
-          otherAccountsSort === "subscription_asc" ? "asc" : "desc"
-        );
-        if (subscriptionDiff !== 0) return subscriptionDiff;
-
-        const deadlineDiff =
-          getResetDeadline(a.usage?.primary_resets_at) -
-          getResetDeadline(b.usage?.primary_resets_at);
-        if (deadlineDiff !== 0) return deadlineDiff;
-
-        const remainingDiff =
-          getRemainingPercent(b.usage?.primary_used_percent) -
-          getRemainingPercent(a.usage?.primary_used_percent);
-        if (remainingDiff !== 0) return remainingDiff;
-
-        return a.name.localeCompare(b.name);
-      }
-
-      if (otherAccountsSort === "deadline_asc" || otherAccountsSort === "deadline_desc") {
-        const deadlineDiff =
-          getResetDeadline(a.usage?.primary_resets_at) -
-          getResetDeadline(b.usage?.primary_resets_at);
-        if (deadlineDiff !== 0) {
-          return otherAccountsSort === "deadline_asc" ? deadlineDiff : -deadlineDiff;
-        }
-        const remainingDiff =
-          getRemainingPercent(b.usage?.primary_used_percent) -
-          getRemainingPercent(a.usage?.primary_used_percent);
-        if (remainingDiff !== 0) return remainingDiff;
-        return a.name.localeCompare(b.name);
-      }
-
-      const remainingDiff =
-        getRemainingPercent(b.usage?.primary_used_percent) -
-        getRemainingPercent(a.usage?.primary_used_percent);
-      if (otherAccountsSort === "remaining_desc" && remainingDiff !== 0) {
-        return remainingDiff;
-      }
-      if (otherAccountsSort === "remaining_asc" && remainingDiff !== 0) {
-        return -remainingDiff;
-      }
-      const deadlineDiff =
-        getResetDeadline(a.usage?.primary_resets_at) -
-        getResetDeadline(b.usage?.primary_resets_at);
-      if (deadlineDiff !== 0) return deadlineDiff;
-      return a.name.localeCompare(b.name);
-    });
-  }, [otherAccounts, otherAccountsSort]);
+  const sortedAccounts = useMemo(
+    () => sortAccountsForDisplay(accounts, accountSort),
+    [accounts, accountSort],
+  );
+  const availableAccounts = sortedAccounts.filter((account) => !isUsageExhausted(account.usage));
+  const limitedAccounts = sortedAccounts.filter((account) => isUsageExhausted(account.usage));
 
   return (
-    <div className="min-h-screen bg-gray-50 text-gray-900 dark:bg-gray-950 dark:text-gray-100">
-      <header className="sticky top-0 z-40 border-b border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900">
-        <div className="flex h-9 items-center bg-white px-3 dark:bg-gray-900">
-          <div
-            onMouseDown={handleTitlebarDrag}
-            onDoubleClick={handleTitlebarDoubleClick}
-            className={`h-full flex-1 select-none cursor-default ${isMacOs ? "ml-18 mr-2" : "mr-3"}`}
-          />
-          {!isMacOs && (
+    <div className="min-h-screen bg-stone-50 text-stone-950 dark:bg-[#151413] dark:text-stone-100">
+      <header className="sticky top-0 z-40 border-b border-stone-200/80 bg-stone-50/90 backdrop-blur dark:border-stone-800 dark:bg-[#151413]/90">
+        {!isMacOs && (
+          <div className="flex h-9 items-center px-3">
+            <div
+              onMouseDown={handleTitlebarDrag}
+              onDoubleClick={handleTitlebarDoubleClick}
+              className="mr-3 h-full flex-1 cursor-default select-none"
+            />
             <div className="flex items-center gap-1">
               <button
                 onClick={() => {
-                  void appWindow.minimize();
+                  void appWindow?.minimize();
                 }}
-                className="flex h-8 w-8 items-center justify-center rounded-md text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-100"
+                className="flex h-8 w-8 items-center justify-center rounded-md text-stone-500 transition-colors hover:bg-stone-200 hover:text-stone-900 dark:text-stone-400 dark:hover:bg-stone-800 dark:hover:text-stone-100"
                 title="Minimize"
               >
                 <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor">
@@ -524,9 +513,9 @@ function App() {
               </button>
               <button
                 onClick={() => {
-                  void appWindow.toggleMaximize();
+                  void appWindow?.toggleMaximize();
                 }}
-                className="flex h-8 w-8 items-center justify-center rounded-md text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-100"
+                className="flex h-8 w-8 items-center justify-center rounded-md text-stone-500 transition-colors hover:bg-stone-200 hover:text-stone-900 dark:text-stone-400 dark:hover:bg-stone-800 dark:hover:text-stone-100"
                 title={isWindowMaximized ? "Restore" : "Maximize"}
               >
                 {isWindowMaximized ? (
@@ -542,118 +531,104 @@ function App() {
               </button>
               <button
                 onClick={() => {
-                  void appWindow.close();
+                  void appWindow?.close();
                 }}
-                className="flex h-8 w-8 items-center justify-center rounded-md text-gray-500 transition-colors hover:bg-red-500 hover:text-white dark:text-gray-400 dark:hover:bg-red-500 dark:hover:text-white"
+                className="flex h-8 w-8 items-center justify-center rounded-md text-stone-500 transition-colors hover:bg-red-500 hover:text-white dark:text-stone-400 dark:hover:bg-red-500 dark:hover:text-white"
                 title="Close"
               >
-                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                  <path d="M6 6l12 12M18 6L6 18" strokeWidth="2" strokeLinecap="round" />
-                </svg>
+                <CloseIcon className="h-4 w-4" />
               </button>
             </div>
-          )}
-        </div>
+          </div>
+        )}
 
-        <div className="max-w-5xl mx-auto px-6 py-4">
+        <div className="mx-auto max-w-5xl px-6 py-4">
           <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_max-content] md:items-center md:gap-4">
-            <div className="flex items-center gap-3 min-w-0 flex-1">
-              <div className="h-10 w-10 rounded-xl bg-black flex items-center justify-center text-white font-bold text-lg">
-                C
+            <div className="flex min-w-0 flex-1 items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-sm font-semibold text-stone-900 shadow-sm dark:border-stone-800 dark:bg-stone-950 dark:text-stone-100">
+                CS
               </div>
               <div className="min-w-0">
-                <div className="flex items-center gap-2 flex-wrap">
-                  <h1 className="text-xl font-bold text-gray-900 dark:text-gray-100 tracking-tight">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h1 className="text-xl font-semibold tracking-tight text-stone-950 dark:text-stone-50">
                     Codex Switcher
                   </h1>
                   {processInfo && (
                     <span
-                      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs border ${hasRunningProcesses
-                          ? "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-900/30 dark:text-amber-300 dark:border-amber-700"
-                          : "bg-green-50 text-green-700 border-green-200 dark:bg-green-900/30 dark:text-green-300 dark:border-green-700"
-                        }`}
+                      className={`inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-xs ring-1 ${
+                        hasRunningProcesses
+                          ? "bg-amber-50 text-amber-800 ring-amber-200 dark:bg-amber-950/40 dark:text-amber-200 dark:ring-amber-800"
+                          : "bg-emerald-50 text-emerald-700 ring-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-200 dark:ring-emerald-800"
+                      }`}
                     >
                       <span
-                        className={`inline-block w-1.5 h-1.5 rounded-full ${hasRunningProcesses ? "bg-amber-500" : "bg-green-500"
-                          }`}
-                      ></span>
-                      <span>
-                        {hasRunningProcesses
-                          ? `${processInfo.count} Codex running`
-                          : "0 Codex running"}
-                      </span>
+                        className={`h-1.5 w-1.5 rounded-full ${
+                          hasRunningProcesses ? "bg-amber-500" : "bg-emerald-500"
+                        }`}
+                      />
+                      {hasRunningProcesses
+                        ? `${processInfo.count} Codex running`
+                        : "0 Codex running"}
                     </span>
                   )}
                 </div>
-                <p className="text-xs text-gray-500 dark:text-gray-400">
+                <p className="text-xs text-stone-500 dark:text-stone-400">
                   Multi-account manager for Codex CLI
                 </p>
               </div>
             </div>
 
-            <div className="flex flex-wrap items-center gap-2 shrink-0 md:ml-4 md:w-max md:flex-nowrap md:justify-end">
+            <div className="flex flex-wrap items-center gap-2 md:flex-nowrap md:justify-end">
               <button
                 onClick={toggleMaskAll}
-                className="flex h-10 w-10 items-center justify-center rounded-lg bg-gray-100 text-gray-700 transition-colors hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700 shrink-0"
+                className="flex h-10 w-10 items-center justify-center rounded-md bg-white text-stone-600 ring-1 ring-stone-200 transition-colors hover:bg-stone-100 dark:bg-stone-950 dark:text-stone-300 dark:ring-stone-800 dark:hover:bg-stone-900"
                 title={allMasked ? "Show all account names and emails" : "Hide all account names and emails"}
               >
-                {allMasked ? (
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"
-                    />
-                  </svg>
-                ) : (
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
-                  </svg>
-                )}
+                {allMasked ? <EyeOffIcon /> : <EyeIcon />}
               </button>
               <button
                 onClick={handleRefresh}
                 disabled={isRefreshing}
-                className="flex h-10 w-10 items-center justify-center rounded-lg bg-gray-100 text-gray-700 transition-colors hover:bg-gray-200 disabled:opacity-50 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700 shrink-0"
+                className="flex h-10 w-10 items-center justify-center rounded-md bg-white text-stone-600 ring-1 ring-stone-200 transition-colors hover:bg-stone-100 disabled:opacity-50 dark:bg-stone-950 dark:text-stone-300 dark:ring-stone-800 dark:hover:bg-stone-900"
                 title={isRefreshing ? "Refreshing all usage" : "Refresh all usage"}
               >
-                <span className={isRefreshing ? "animate-spin inline-block" : ""}>↻</span>
+                <RefreshIcon className={isRefreshing ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
               </button>
               <button
                 onClick={handleWarmupAll}
                 disabled={isWarmingAll || accounts.length === 0}
-                className="flex h-10 w-10 items-center justify-center rounded-lg bg-gray-100 text-gray-700 transition-colors hover:bg-gray-200 disabled:opacity-50 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700 shrink-0"
+                className="flex h-10 w-10 items-center justify-center rounded-md bg-white text-stone-600 ring-1 ring-stone-200 transition-colors hover:bg-stone-100 disabled:opacity-50 dark:bg-stone-950 dark:text-stone-300 dark:ring-stone-800 dark:hover:bg-stone-900"
                 title="Send minimal traffic using all accounts"
               >
-                <span className={isWarmingAll ? "animate-pulse" : ""}>⚡</span>
+                <BoltIcon className={isWarmingAll ? "h-4 w-4 animate-pulse" : "h-4 w-4"} />
               </button>
               <button
                 onClick={() => setThemeMode((prev) => (prev === "dark" ? "light" : "dark"))}
-                className="flex h-10 w-10 items-center justify-center rounded-lg bg-gray-100 text-lg text-gray-700 transition-colors hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700 shrink-0"
+                className="flex h-10 w-10 items-center justify-center rounded-md bg-white text-stone-600 ring-1 ring-stone-200 transition-colors hover:bg-stone-100 dark:bg-stone-950 dark:text-stone-300 dark:ring-stone-800 dark:hover:bg-stone-900"
                 title={themeMode === "dark" ? "Switch to light mode" : "Switch to dark mode"}
               >
-                {themeMode === "dark" ? "☀" : "☾"}
+                {themeMode === "dark" ? <SunIcon /> : <MoonIcon />}
               </button>
 
               <div className="relative" ref={actionsMenuRef}>
                 <button
                   onClick={() => setIsActionsMenuOpen((prev) => !prev)}
-                  className="h-10 px-4 py-2 text-sm font-medium rounded-lg bg-gray-900 text-white transition-colors hover:bg-gray-800 dark:bg-black dark:hover:bg-neutral-900 shrink-0 whitespace-nowrap"
+                  className="flex h-10 items-center gap-2 rounded-md bg-stone-950 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-stone-800 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-white"
                 >
-                  Account ▾
+                  <MenuIcon />
+                  Account
+                  <ChevronDownIcon className="h-3.5 w-3.5" />
                 </button>
                 {isActionsMenuOpen && (
-                  <div className="absolute right-0 z-50 mt-2 w-56 rounded-xl border border-gray-200 bg-white p-2 text-gray-700 shadow-xl dark:border-neutral-800 dark:bg-black dark:text-white">
+                  <div className="absolute right-0 z-50 mt-2 w-60 rounded-lg border border-stone-200 bg-white p-2 text-stone-700 shadow-xl dark:border-stone-800 dark:bg-stone-950 dark:text-stone-100">
                     <button
                       onClick={() => {
                         setIsActionsMenuOpen(false);
                         setIsAddModalOpen(true);
                       }}
-                      className="w-full rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-gray-100 dark:text-white dark:hover:bg-neutral-900"
+                      className="w-full rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-stone-100 dark:hover:bg-stone-900"
                     >
-                      + Add Account
+                      Add Account
                     </button>
                     <button
                       onClick={() => {
@@ -661,7 +636,7 @@ function App() {
                         void handleExportSlimText();
                       }}
                       disabled={isExportingSlim}
-                      className="w-full rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-gray-100 disabled:opacity-50 dark:text-white dark:hover:bg-neutral-900"
+                      className="w-full rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-stone-100 disabled:opacity-50 dark:hover:bg-stone-900"
                     >
                       {isExportingSlim ? "Exporting..." : "Export Slim Text"}
                     </button>
@@ -671,7 +646,7 @@ function App() {
                         openImportSlimTextModal();
                       }}
                       disabled={isImportingSlim}
-                      className="w-full rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-gray-100 disabled:opacity-50 dark:text-white dark:hover:bg-neutral-900"
+                      className="w-full rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-stone-100 disabled:opacity-50 dark:hover:bg-stone-900"
                     >
                       {isImportingSlim ? "Importing..." : "Import Slim Text"}
                     </button>
@@ -681,7 +656,7 @@ function App() {
                         void handleExportFullFile();
                       }}
                       disabled={isExportingFull}
-                      className="w-full rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-gray-100 disabled:opacity-50 dark:text-white dark:hover:bg-neutral-900"
+                      className="w-full rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-stone-100 disabled:opacity-50 dark:hover:bg-stone-900"
                     >
                       {isExportingFull ? "Exporting..." : "Export Full Encrypted File"}
                     </button>
@@ -691,7 +666,7 @@ function App() {
                         void handleImportFullFile();
                       }}
                       disabled={isImportingFull}
-                      className="w-full rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-gray-100 disabled:opacity-50 dark:text-white dark:hover:bg-neutral-900"
+                      className="w-full rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-stone-100 disabled:opacity-50 dark:hover:bg-stone-900"
                     >
                       {isImportingFull ? "Importing..." : "Import Full Encrypted File"}
                     </button>
@@ -703,135 +678,113 @@ function App() {
         </div>
       </header>
 
-      {/* Main Content */}
-      <main className="max-w-5xl mx-auto px-6 py-8">
+      <main className="mx-auto max-w-5xl px-6 py-8">
         {loading && accounts.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-20">
-            <div className="animate-spin h-10 w-10 border-2 border-gray-900 dark:border-gray-100 border-t-transparent rounded-full mb-4"></div>
-            <p className="text-gray-500 dark:text-gray-400">Loading accounts...</p>
+            <div className="mb-4 h-10 w-10 animate-spin rounded-full border-2 border-stone-900 border-t-transparent dark:border-stone-100 dark:border-t-transparent" />
+            <p className="text-stone-500 dark:text-stone-400">Loading accounts...</p>
           </div>
         ) : error ? (
-          <div className="text-center py-20">
-            <div className="text-red-600 dark:text-red-300 mb-2">Failed to load accounts</div>
-            <p className="text-sm text-gray-500 dark:text-gray-400">{error}</p>
+          <div className="py-20 text-center">
+            <div className="mb-2 text-red-600 dark:text-red-300">Failed to load accounts</div>
+            <p className="text-sm text-stone-500 dark:text-stone-400">{error}</p>
           </div>
         ) : accounts.length === 0 ? (
-          <div className="text-center py-20">
-            <div className="h-16 w-16 rounded-2xl bg-gray-100 dark:bg-gray-800 flex items-center justify-center mx-auto mb-4">
-              <span className="text-3xl">👤</span>
+          <div className="py-20 text-center">
+            <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-500 dark:border-stone-800 dark:bg-stone-950 dark:text-stone-400">
+              <UserIcon className="h-7 w-7" />
             </div>
-            <h2 className="text-xl font-semibold text-gray-900 dark:text-gray-100 mb-2">
+            <h2 className="mb-2 text-xl font-semibold text-stone-950 dark:text-stone-50">
               No accounts yet
             </h2>
-            <p className="text-gray-500 dark:text-gray-400 mb-6">
+            <p className="mb-6 text-stone-500 dark:text-stone-400">
               Add your first Codex account to get started
             </p>
             <button
               onClick={() => setIsAddModalOpen(true)}
-              className="px-6 py-3 text-sm font-medium rounded-lg bg-gray-900 hover:bg-gray-800 dark:bg-gray-100 dark:hover:bg-gray-200 text-white dark:text-gray-900 transition-colors"
+              className="rounded-md bg-stone-950 px-6 py-3 text-sm font-medium text-white transition-colors hover:bg-stone-800 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-white"
             >
               Add Account
             </button>
           </div>
         ) : (
           <div className="space-y-8">
-            {/* Active Account */}
-            {activeAccount && (
-              <section>
-                <h2 className="text-sm font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-4">
-                  Active Account
-                </h2>
-                <AccountCard
-                  account={activeAccount}
-                  onSwitch={() => { }}
-                  onWarmup={() =>
-                    handleWarmupAccount(activeAccount.id, activeAccount.name)
-                  }
-                  onDelete={() => handleDelete(activeAccount.id)}
-                  onRefresh={() =>
-                    refreshSingleUsage(activeAccount.id, { refreshMetadata: true })
-                  }
-                  onRename={(newName) => renameAccount(activeAccount.id, newName)}
-                  switching={switchingId === activeAccount.id}
-                  switchDisabled={hasRunningProcesses ?? false}
-                  warmingUp={isWarmingAll || warmingUpId === activeAccount.id}
-                  masked={maskedAccounts.has(activeAccount.id)}
-                  onToggleMask={() => toggleMask(activeAccount.id)}
-                />
-              </section>
-            )}
-
-            {/* Other Accounts */}
-            {otherAccounts.length > 0 && (
-              <section>
-                <div className="flex items-center justify-between gap-3 mb-4">
-                  <h2 className="text-sm font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                    Other Accounts ({otherAccounts.length})
+            <section>
+              <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+                <div>
+                  <h2 className="text-sm font-medium uppercase tracking-wider text-stone-500 dark:text-stone-400">
+                    Available Accounts ({availableAccounts.length})
                   </h2>
-                  <div className="flex items-center gap-2">
-                    <label htmlFor="other-accounts-sort" className="text-xs text-gray-500 dark:text-gray-400">
-                      Sort
-                    </label>
-                    <div className="relative">
-                      <select
-                        id="other-accounts-sort"
-                        value={otherAccountsSort}
-                        onChange={(e) =>
-                          setOtherAccountsSort(
-                            e.target.value as
-                              | "deadline_asc"
-                              | "deadline_desc"
-                              | "remaining_desc"
-                              | "remaining_asc"
-                              | "subscription_asc"
-                              | "subscription_desc"
-                          )
-                        }
-                        className="appearance-none font-sans text-xs sm:text-sm font-medium pl-3 pr-9 py-2 rounded-xl border border-gray-300 dark:border-gray-700 bg-gradient-to-b from-white to-gray-50 dark:from-gray-900 dark:to-gray-800 text-gray-700 dark:text-gray-200 shadow-sm hover:border-gray-400 dark:hover:border-gray-600 hover:shadow focus:outline-none focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-600 focus:border-gray-400 dark:focus:border-gray-600 transition-all"
-                      >
-                        <option value="deadline_asc">Reset: earliest to latest</option>
-                        <option value="deadline_desc">Reset: latest to earliest</option>
-                        <option value="remaining_desc">
-                          % remaining: highest to lowest
-                        </option>
-                        <option value="remaining_asc">
-                          % remaining: lowest to highest
-                        </option>
-                        <option value="subscription_asc">
-                          Expiry: earliest to latest
-                        </option>
-                        <option value="subscription_desc">
-                          Expiry: latest to earliest
-                        </option>
-                      </select>
-                      <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-gray-500 dark:text-gray-400">
-                        <svg
-                          className="h-4 w-4"
-                          viewBox="0 0 20 20"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="2"
-                        >
-                          <path d="M6 8l4 4 4-4" strokeLinecap="round" strokeLinejoin="round" />
-                        </svg>
-                      </span>
-                    </div>
+                  <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">
+                    Accounts with limit remaining stay above exhausted accounts.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <label htmlFor="account-sort" className="text-xs text-stone-500 dark:text-stone-400">
+                    Sort
+                  </label>
+                  <div className="relative">
+                    <select
+                      id="account-sort"
+                      value={accountSort}
+                      onChange={(event) => setAccountSort(event.target.value as AccountSortMode)}
+                      className="appearance-none rounded-md border border-stone-300 bg-white py-2 pl-3 pr-9 text-sm font-medium text-stone-700 shadow-sm outline-none transition-colors hover:border-stone-400 focus:border-stone-500 focus:ring-2 focus:ring-stone-200 dark:border-stone-700 dark:bg-stone-950 dark:text-stone-200 dark:hover:border-stone-600 dark:focus:border-stone-500 dark:focus:ring-stone-800"
+                    >
+                      <option value="deadline_asc">Reset: earliest to latest</option>
+                      <option value="deadline_desc">Reset: latest to earliest</option>
+                      <option value="remaining_desc">Remaining: highest to lowest</option>
+                      <option value="remaining_asc">Remaining: lowest to highest</option>
+                      <option value="subscription_asc">Expiry: earliest to latest</option>
+                      <option value="subscription_desc">Expiry: latest to earliest</option>
+                    </select>
+                    <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-stone-500 dark:text-stone-400">
+                      <ChevronDownIcon className="h-4 w-4" />
+                    </span>
                   </div>
                 </div>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {sortedOtherAccounts.map((account) => (
+              </div>
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                {availableAccounts.map((account) => (
+                  <AccountCard
+                    key={account.id}
+                    account={account}
+                    onSwitch={() => handleSwitch(account.id)}
+                    onWarmup={() => handleWarmupAccount(account.id, account.name)}
+                    onDelete={() => handleDelete(account.id)}
+                    onRefresh={() => refreshSingleUsage(account.id, { refreshMetadata: true })}
+                    onRename={(newName) => renameAccount(account.id, newName)}
+                    switching={switchingId === account.id}
+                    liveSwitch={hasRunningProcesses ?? false}
+                    warmingUp={isWarmingAll || warmingUpId === account.id}
+                    masked={maskedAccounts.has(account.id)}
+                    onToggleMask={() => toggleMask(account.id)}
+                  />
+                ))}
+              </div>
+            </section>
+
+            {limitedAccounts.length > 0 && (
+              <section>
+                <div className="mb-4">
+                  <h2 className="text-sm font-medium uppercase tracking-wider text-stone-500 dark:text-stone-400">
+                    Limited Accounts ({limitedAccounts.length})
+                  </h2>
+                  <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">
+                    These accounts are kept at the bottom until their limits reset.
+                  </p>
+                </div>
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                  {limitedAccounts.map((account) => (
                     <AccountCard
                       key={account.id}
                       account={account}
                       onSwitch={() => handleSwitch(account.id)}
                       onWarmup={() => handleWarmupAccount(account.id, account.name)}
                       onDelete={() => handleDelete(account.id)}
-                      onRefresh={() =>
-                        refreshSingleUsage(account.id, { refreshMetadata: true })
-                      }
+                      onRefresh={() => refreshSingleUsage(account.id, { refreshMetadata: true })}
                       onRename={(newName) => renameAccount(account.id, newName)}
                       switching={switchingId === account.id}
-                      switchDisabled={hasRunningProcesses ?? false}
+                      liveSwitch={hasRunningProcesses ?? false}
                       warmingUp={isWarmingAll || warmingUpId === account.id}
                       masked={maskedAccounts.has(account.id)}
                       onToggleMask={() => toggleMask(account.id)}
@@ -847,7 +800,7 @@ function App() {
       {/* Refresh Success Toast */}
       {refreshSuccess && (
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 px-4 py-3 bg-green-600 text-white rounded-lg shadow-lg text-sm flex items-center gap-2">
-          <span>✓</span> Usage refreshed successfully
+          <CheckIcon className="h-4 w-4" /> Usage refreshed successfully
         </div>
       )}
 
@@ -883,17 +836,18 @@ function App() {
 
       {/* Import/Export Config Modal */}
       {isConfigModalOpen && (
-        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
-          <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-2xl w-full max-w-2xl mx-4 shadow-xl">
-            <div className="flex items-center justify-between p-5 border-b border-gray-100 dark:border-gray-800">
-              <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+          <div className="w-full max-w-2xl overflow-hidden rounded-lg border border-stone-200 bg-white shadow-xl dark:border-stone-800 dark:bg-stone-950">
+            <div className="flex items-center justify-between border-b border-stone-100 p-5 dark:border-stone-800">
+              <h2 className="text-lg font-semibold text-stone-950 dark:text-stone-50">
                 {configModalMode === "slim_export" ? "Export Slim Text" : "Import Slim Text"}
               </h2>
               <button
                 onClick={() => setIsConfigModalOpen(false)}
-                className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors"
+                className="flex h-8 w-8 items-center justify-center rounded-md text-stone-400 transition-colors hover:bg-stone-100 hover:text-stone-700 dark:text-stone-500 dark:hover:bg-stone-900 dark:hover:text-stone-200"
+                title="Close"
               >
-                ✕
+                <CloseIcon className="h-4 w-4" />
               </button>
             </div>
             <div className="p-5 space-y-4">
@@ -902,7 +856,7 @@ function App() {
                   Existing accounts are kept. Only missing accounts are imported.
                 </p>
               ) : (
-                <p className="text-sm text-gray-500 dark:text-gray-400">
+                <p className="text-sm text-stone-500 dark:text-stone-400">
                   This slim string contains account secrets. Keep it private.
                 </p>
               )}
@@ -917,7 +871,7 @@ function App() {
                       : "Export string will appear here"
                     : "Paste config string here"
                 }
-                className="w-full h-48 px-4 py-3 bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg text-sm text-gray-800 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:border-gray-400 dark:focus:border-gray-500 focus:ring-1 focus:ring-gray-400 dark:focus:ring-gray-500 font-mono"
+                className="h-48 w-full rounded-lg border border-stone-200 bg-stone-50 px-4 py-3 font-mono text-sm text-stone-800 outline-none transition-colors placeholder-stone-400 focus:border-stone-400 focus:ring-2 focus:ring-stone-200 dark:border-stone-800 dark:bg-stone-900 dark:text-stone-100 dark:placeholder-stone-500 dark:focus:border-stone-600 dark:focus:ring-stone-800"
               />
               {configModalError && (
                 <div className="p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-700 rounded-lg text-red-600 dark:text-red-300 text-sm">
@@ -925,10 +879,10 @@ function App() {
                 </div>
               )}
             </div>
-            <div className="flex gap-3 p-5 border-t border-gray-100 dark:border-gray-800">
+            <div className="flex gap-3 border-t border-stone-100 p-5 dark:border-stone-800">
               <button
                 onClick={() => setIsConfigModalOpen(false)}
-                className="px-4 py-2.5 text-sm font-medium rounded-lg bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-200 transition-colors"
+                className="rounded-md bg-stone-100 px-4 py-2.5 text-sm font-medium text-stone-700 transition-colors hover:bg-stone-200 dark:bg-stone-900 dark:text-stone-200 dark:hover:bg-stone-800"
               >
                 Close
               </button>
@@ -945,7 +899,7 @@ function App() {
                     }
                   }}
                   disabled={!configPayload || isExportingSlim}
-                  className="px-4 py-2.5 text-sm font-medium rounded-lg bg-gray-900 hover:bg-gray-800 dark:bg-gray-100 dark:hover:bg-gray-200 text-white dark:text-gray-900 transition-colors disabled:opacity-50"
+                  className="rounded-md bg-stone-950 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-stone-800 disabled:opacity-50 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-white"
                 >
                   {configCopied ? "Copied" : "Copy String"}
                 </button>
@@ -953,7 +907,7 @@ function App() {
                 <button
                   onClick={handleImportSlimText}
                   disabled={isImportingSlim}
-                  className="px-4 py-2.5 text-sm font-medium rounded-lg bg-gray-900 hover:bg-gray-800 dark:bg-gray-100 dark:hover:bg-gray-200 text-white dark:text-gray-900 transition-colors disabled:opacity-50"
+                  className="rounded-md bg-stone-950 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-stone-800 disabled:opacity-50 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-white"
                 >
                   {isImportingSlim ? "Importing..." : "Import Missing Accounts"}
                 </button>

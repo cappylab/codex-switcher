@@ -1,16 +1,25 @@
 //! ChatGPT OAuth token refresh helpers
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use anyhow::{Context, Result};
 use base64::Engine;
 use chrono::Utc;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::time::{sleep, Duration};
 
-use super::{load_accounts, switch_to_account, update_account_chatgpt_tokens};
+use super::{
+    load_accounts_synced_with_current_auth, switch_to_account, update_account_chatgpt_tokens,
+};
 use crate::types::{parse_chatgpt_id_token_claims, AuthData, StoredAccount};
 
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const EXPIRY_SKEW_SECONDS: i64 = 60;
+
+static ACCOUNT_REFRESH_LOCKS: OnceLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> =
+    OnceLock::new();
 
 #[derive(Debug, serde::Deserialize)]
 struct RefreshTokenResponse {
@@ -42,18 +51,44 @@ pub async fn ensure_chatgpt_tokens_fresh(account: &StoredAccount) -> Result<Stor
 
 /// Force-refresh ChatGPT OAuth tokens for an account.
 pub async fn refresh_chatgpt_tokens(account: &StoredAccount) -> Result<StoredAccount> {
-    let (current_id_token, current_refresh_token, current_account_id) = match &account.auth_data {
-        AuthData::ApiKey { .. } => return Ok(account.clone()),
-        AuthData::ChatGPT {
-            id_token,
-            refresh_token,
-            account_id,
-            ..
-        } => (id_token.clone(), refresh_token.clone(), account_id.clone()),
+    if matches!(&account.auth_data, AuthData::ApiKey { .. }) {
+        return Ok(account.clone());
+    }
+
+    let _refresh_guard = acquire_account_refresh_lock(&account.id).await;
+    let store = load_accounts_synced_with_current_auth()?;
+    let is_active = store.active_account_id.as_deref() == Some(account.id.as_str());
+
+    let account_to_refresh = match store
+        .accounts
+        .into_iter()
+        .find(|stored_account| stored_account.id == account.id)
+    {
+        Some(stored_account) => {
+            if stored_refresh_token_rotated_since_request(account, &stored_account) {
+                return Ok(stored_account);
+            }
+            stored_account
+        }
+        None => account.clone(),
     };
 
+    let (current_id_token, current_refresh_token, current_account_id) =
+        match &account_to_refresh.auth_data {
+            AuthData::ApiKey { .. } => return Ok(account.clone()),
+            AuthData::ChatGPT {
+                id_token,
+                refresh_token,
+                account_id,
+                ..
+            } => (id_token.clone(), refresh_token.clone(), account_id.clone()),
+        };
+
     if current_refresh_token.is_empty() {
-        anyhow::bail!("Missing refresh token for account {}", account.name);
+        anyhow::bail!(
+            "Missing refresh token for account {}",
+            account_to_refresh.name
+        );
     }
 
     let refreshed = refresh_tokens_with_refresh_token(&current_refresh_token).await?;
@@ -65,10 +100,8 @@ pub async fn refresh_chatgpt_tokens(account: &StoredAccount) -> Result<StoredAcc
     let claims = parse_chatgpt_id_token_claims(&next_id_token);
     let next_account_id = claims.account_id.or(current_account_id);
 
-    let is_active = load_accounts()?.active_account_id.as_deref() == Some(account.id.as_str());
-
     let updated = update_account_chatgpt_tokens(
-        &account.id,
+        &account_to_refresh.id,
         next_id_token,
         refreshed.access_token,
         next_refresh_token,
@@ -187,4 +220,85 @@ async fn refresh_tokens_with_refresh_token(refresh_token: &str) -> Result<Refres
         .json::<RefreshTokenResponse>()
         .await
         .context("Failed to parse token refresh response")
+}
+
+async fn acquire_account_refresh_lock(account_id: &str) -> OwnedMutexGuard<()> {
+    let account_lock = {
+        let locks = ACCOUNT_REFRESH_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut locks = locks.lock().expect("account refresh lock poisoned");
+        locks
+            .entry(account_id.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    };
+
+    account_lock.lock_owned().await
+}
+
+fn stored_refresh_token_rotated_since_request(
+    requested: &StoredAccount,
+    latest: &StoredAccount,
+) -> bool {
+    if requested.id != latest.id {
+        return false;
+    }
+
+    match (
+        chatgpt_refresh_token(requested),
+        chatgpt_refresh_token(latest),
+    ) {
+        (Some(requested_refresh_token), Some(latest_refresh_token)) => {
+            requested_refresh_token != latest_refresh_token
+        }
+        _ => false,
+    }
+}
+
+fn chatgpt_refresh_token(account: &StoredAccount) -> Option<&str> {
+    match &account.auth_data {
+        AuthData::ChatGPT { refresh_token, .. } => Some(refresh_token.as_str()),
+        AuthData::ApiKey { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stored_refresh_token_rotated_since_request;
+    use crate::types::StoredAccount;
+
+    fn chatgpt_account(refresh_token: &str) -> StoredAccount {
+        StoredAccount::new_chatgpt(
+            "test".to_string(),
+            Some("test@example.com".to_string()),
+            Some("plus".to_string()),
+            None,
+            "header.payload.signature".to_string(),
+            "access-token".to_string(),
+            refresh_token.to_string(),
+            Some("acct_test".to_string()),
+        )
+    }
+
+    #[test]
+    fn detects_refresh_token_rotated_after_request_started() {
+        let requested = chatgpt_account("old-refresh-token");
+        let mut latest = requested.clone();
+        if let crate::types::AuthData::ChatGPT { refresh_token, .. } = &mut latest.auth_data {
+            *refresh_token = "new-refresh-token".to_string();
+        }
+
+        assert!(stored_refresh_token_rotated_since_request(
+            &requested, &latest
+        ));
+    }
+
+    #[test]
+    fn does_not_report_rotation_when_refresh_token_matches() {
+        let requested = chatgpt_account("same-refresh-token");
+        let latest = requested.clone();
+
+        assert!(!stored_refresh_token_rotated_since_request(
+            &requested, &latest
+        ));
+    }
 }

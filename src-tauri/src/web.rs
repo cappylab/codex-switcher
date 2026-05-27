@@ -10,19 +10,35 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use tokio::runtime::Runtime;
 
 use crate::commands::{
-    add_account_from_auth_json_text, add_account_from_file, cancel_login, check_codex_processes,
-    complete_login, delete_account, export_accounts_full_encrypted_bytes,
-    export_accounts_slim_text, get_active_account_info, get_masked_account_ids, get_usage,
-    import_accounts_full_encrypted_bytes, import_accounts_slim_text, list_accounts,
-    refresh_account_metadata, refresh_all_accounts_usage, rename_account, set_masked_account_ids,
-    start_login, switch_account, warmup_account, warmup_all_accounts,
+    add_account_from_auth_json_text, add_account_from_file, auto_switch_account_for_usage,
+    cancel_login, check_codex_processes, complete_login, delete_account,
+    export_accounts_full_encrypted_bytes, export_accounts_slim_text, get_active_account_info,
+    get_masked_account_ids, get_usage, import_accounts_full_encrypted_bytes,
+    import_accounts_slim_text, list_accounts, refresh_account_metadata, refresh_all_accounts_usage,
+    rename_account, set_masked_account_ids, start_login, switch_account, warmup_account,
+    warmup_all_accounts,
 };
+use crate::types::UsageInfo;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AccountIdArgs {
     #[serde(alias = "account_id")]
     account_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SwitchAccountArgs {
+    #[serde(alias = "account_id")]
+    account_id: String,
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutoSwitchArgs {
+    usages: Vec<UsageInfo>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +78,12 @@ struct UploadAuthJsonArgs {
 struct UploadEncryptedArgs {
     #[serde(alias = "contents_base64")]
     contents_base64: String,
+    passphrase: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExportEncryptedArgs {
+    passphrase: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,8 +174,12 @@ async fn invoke_web_command(command: &str, payload: Value) -> Result<Value, Stri
         }
         "warmup_all_accounts" => to_json(warmup_all_accounts().await?),
         "switch_account" => {
-            let args: AccountIdArgs = parse_args(payload)?;
-            to_json(switch_account(args.account_id).await?)
+            let args: SwitchAccountArgs = parse_args(payload)?;
+            to_json(switch_account(args.account_id, Some(args.force)).await?)
+        }
+        "auto_switch_account_for_usage" => {
+            let args: AutoSwitchArgs = parse_args(payload)?;
+            to_json(auto_switch_account_for_usage(args.usages).await?)
         }
         "delete_account" => {
             let args: AccountIdArgs = parse_args(payload)?;
@@ -175,7 +201,9 @@ async fn invoke_web_command(command: &str, payload: Value) -> Result<Value, Stri
             to_json(import_accounts_slim_text(args.payload).await?)
         }
         "export_accounts_full_encrypted_bytes" => {
-            let encoded = STANDARD.encode(export_accounts_full_encrypted_bytes().await?);
+            let args: ExportEncryptedArgs = parse_args(payload)?;
+            let encoded =
+                STANDARD.encode(export_accounts_full_encrypted_bytes(args.passphrase).await?);
             to_json(encoded)
         }
         "import_accounts_full_encrypted_bytes" => {
@@ -183,7 +211,7 @@ async fn invoke_web_command(command: &str, payload: Value) -> Result<Value, Stri
             let bytes = STANDARD
                 .decode(args.contents_base64)
                 .map_err(|error| format!("Failed to decode uploaded backup: {error}"))?;
-            to_json(import_accounts_full_encrypted_bytes(bytes).await?)
+            to_json(import_accounts_full_encrypted_bytes(bytes, args.passphrase).await?)
         }
         "get_masked_account_ids" => to_json(get_masked_account_ids().await?),
         "set_masked_account_ids" => {
@@ -271,6 +299,30 @@ fn serve_file(request: Request, path: PathBuf) -> anyhow::Result<()> {
         .with_header(header("Cache-Control", "no-cache")?);
     request.respond(response)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_args, SwitchAccountArgs};
+    use serde_json::json;
+
+    #[test]
+    fn switch_account_payload_defaults_force_to_false() {
+        let args: SwitchAccountArgs =
+            parse_args(json!({ "accountId": "account-1" })).expect("payload parses");
+
+        assert_eq!(args.account_id, "account-1");
+        assert!(!args.force);
+    }
+
+    #[test]
+    fn switch_account_payload_accepts_force_flag() {
+        let args: SwitchAccountArgs =
+            parse_args(json!({ "accountId": "account-1", "force": true })).expect("payload parses");
+
+        assert_eq!(args.account_id, "account-1");
+        assert!(args.force);
+    }
 }
 
 fn respond_json(request: Request, status: StatusCode, payload: &Value) -> anyhow::Result<()> {

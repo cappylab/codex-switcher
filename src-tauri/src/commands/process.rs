@@ -55,7 +55,7 @@ pub async fn check_codex_processes() -> Result<CodexProcessInfo, String> {
 }
 
 /// Find all running codex processes. Returns (active_pids, background_count)
-fn find_codex_processes() -> anyhow::Result<(Vec<u32>, usize)> {
+pub(crate) fn find_codex_processes() -> anyhow::Result<(Vec<u32>, usize)> {
     #[cfg(unix)]
     {
         let mut pids = Vec::new();
@@ -118,9 +118,10 @@ fn find_codex_processes() -> anyhow::Result<(Vec<u32>, usize)> {
 
                 let is_ide_plugin = is_ide_plugin_process(&lowercase_command);
                 let is_app_server = lowercase_command.contains("codex app-server");
+                let is_sandbox_helper = is_codex_sandbox_helper(&lowercase_command);
                 let has_tty = tty != "??" && tty != "?";
 
-                if is_ide_plugin || is_app_server {
+                if is_ide_plugin || is_app_server || is_sandbox_helper {
                     bg_count += 1;
                     continue;
                 }
@@ -147,6 +148,43 @@ fn find_codex_processes() -> anyhow::Result<(Vec<u32>, usize)> {
 
     #[allow(unreachable_code)]
     Ok((Vec::new(), 0))
+}
+
+pub(crate) fn terminate_codex_processes() -> anyhow::Result<Vec<u32>> {
+    let (pids, _) = find_codex_processes()?;
+
+    for pid in &pids {
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .output();
+        }
+
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .creation_flags(CREATE_NO_WINDOW)
+                .args(["/F", "/PID", &pid.to_string()])
+                .output();
+        }
+    }
+
+    Ok(pids)
+}
+
+#[cfg(unix)]
+fn is_codex_sandbox_helper(command: &str) -> bool {
+    let mut parts = command.split_whitespace();
+    let Some(binary) = parts.next() else {
+        return false;
+    };
+    let Some(subcommand) = parts.next() else {
+        return false;
+    };
+
+    (binary == "codex" || binary.ends_with("/codex")) && subcommand == "sandbox"
 }
 
 #[cfg(windows)]
@@ -309,4 +347,23 @@ where
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    use super::is_codex_sandbox_helper;
+
+    #[cfg(unix)]
+    #[test]
+    fn identifies_codex_sandbox_helper_processes() {
+        assert!(is_codex_sandbox_helper(
+            "/applications/codex.app/contents/resources/codex sandbox macos -- node kernel.js"
+        ));
+        assert!(is_codex_sandbox_helper("codex sandbox macos -- command"));
+        assert!(!is_codex_sandbox_helper("codex"));
+        assert!(!is_codex_sandbox_helper(
+            "codex app-server --listen stdio://"
+        ));
+    }
 }

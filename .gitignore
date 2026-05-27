@@ -11,6 +11,19 @@ node_modules
 dist
 dist-ssr
 *.local
+.env
+.env.*
+auth.json
+accounts.json
+*.cswf
+*.pem
+*.key
+*.p12
+*.mobileprovision
+*backup*
+.codex
+.codex/
+
 
 # Editor directories and files
 .vscode

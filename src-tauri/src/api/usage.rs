@@ -177,10 +177,7 @@ async fn parse_usage_response(
         .text()
         .await
         .context("Failed to read response body")?;
-    println!(
-        "[Usage] Response body: {}",
-        &body_text[..body_text.len().min(200)]
-    );
+    println!("[Usage] Response body: {}", truncate_text(&body_text, 200));
 
     let payload: RateLimitStatusPayload =
         serde_json::from_str(&body_text).context("Failed to parse usage response")?;
@@ -387,10 +384,10 @@ fn log_warmup_response(source: &str, body: &str, is_sse: bool) {
 }
 
 fn truncate_text(text: &str, max_len: usize) -> String {
-    if text.len() <= max_len {
+    if text.chars().count() <= max_len {
         return text.to_string();
     }
-    let mut out = text[..max_len].to_string();
+    let mut out = text.chars().take(max_len).collect::<String>();
     out.push_str("...");
     out
 }
@@ -493,7 +490,7 @@ fn extract_credits(credits: Option<CreditStatusDetails>) -> Option<CreditStatusD
 pub async fn refresh_all_usage(accounts: &[StoredAccount]) -> Vec<UsageInfo> {
     println!("[Usage] Refreshing usage for {} accounts", accounts.len());
 
-    let concurrency = accounts.len().min(10).max(1);
+    let concurrency = accounts.len().clamp(1, 10);
     let results: Vec<UsageInfo> = stream::iter(accounts.iter().cloned())
         .map(|account| async move {
             match get_account_usage(&account).await {
@@ -510,4 +507,14 @@ pub async fn refresh_all_usage(accounts: &[StoredAccount]) -> Vec<UsageInfo> {
 
     println!("[Usage] Refresh complete");
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_text;
+
+    #[test]
+    fn truncate_text_handles_multibyte_boundaries() {
+        assert_eq!(truncate_text("ééé", 1), "é...");
+    }
 }

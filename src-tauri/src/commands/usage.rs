@@ -4,7 +4,10 @@ use crate::api::usage::{
     fetch_chatgpt_account_metadata, get_account_usage, refresh_all_usage,
     warmup_account as send_warmup,
 };
-use crate::auth::{get_account, load_accounts, refresh_chatgpt_tokens, update_account_metadata};
+use crate::auth::{
+    ensure_chatgpt_tokens_fresh, get_account, load_accounts_synced_with_current_auth,
+    update_account_metadata,
+};
 use crate::types::{AccountInfo, AuthData, UsageInfo, WarmupSummary};
 use futures::{stream, StreamExt};
 
@@ -18,8 +21,8 @@ pub async fn get_usage(account_id: String) -> Result<UsageInfo, String> {
     get_account_usage(&account).await.map_err(|e| e.to_string())
 }
 
-/// Force-refresh account metadata for a specific account.
-/// For ChatGPT accounts this refreshes OAuth tokens and pulls live subscription metadata.
+/// Refresh account metadata for a specific account.
+/// For ChatGPT accounts this ensures OAuth tokens are fresh and pulls live subscription metadata.
 /// For API key accounts this is a no-op.
 #[tauri::command]
 pub async fn refresh_account_metadata(account_id: String) -> Result<AccountInfo, String> {
@@ -30,10 +33,10 @@ pub async fn refresh_account_metadata(account_id: String) -> Result<AccountInfo,
     let updated = match &account.auth_data {
         AuthData::ApiKey { .. } => account,
         AuthData::ChatGPT { .. } => {
-            let refreshed = refresh_chatgpt_tokens(&account)
+            let fresh_account = ensure_chatgpt_tokens_fresh(&account)
                 .await
                 .map_err(|e| e.to_string())?;
-            let live_metadata = fetch_chatgpt_account_metadata(&refreshed)
+            let live_metadata = fetch_chatgpt_account_metadata(&fresh_account)
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -48,7 +51,7 @@ pub async fn refresh_account_metadata(account_id: String) -> Result<AccountInfo,
         }
     };
 
-    let store = load_accounts().map_err(|e| e.to_string())?;
+    let store = load_accounts_synced_with_current_auth().map_err(|e| e.to_string())?;
     let active_id = store.active_account_id.as_deref();
     Ok(AccountInfo::from_stored(&updated, active_id))
 }
@@ -56,7 +59,7 @@ pub async fn refresh_account_metadata(account_id: String) -> Result<AccountInfo,
 /// Refresh usage info for all accounts
 #[tauri::command]
 pub async fn refresh_all_accounts_usage() -> Result<Vec<UsageInfo>, String> {
-    let store = load_accounts().map_err(|e| e.to_string())?;
+    let store = load_accounts_synced_with_current_auth().map_err(|e| e.to_string())?;
     Ok(refresh_all_usage(&store.accounts).await)
 }
 
@@ -73,11 +76,11 @@ pub async fn warmup_account(account_id: String) -> Result<(), String> {
 /// Send minimal warm-up requests for all accounts
 #[tauri::command]
 pub async fn warmup_all_accounts() -> Result<WarmupSummary, String> {
-    let store = load_accounts().map_err(|e| e.to_string())?;
+    let store = load_accounts_synced_with_current_auth().map_err(|e| e.to_string())?;
     let total_accounts = store.accounts.len();
-    let concurrency = total_accounts.min(10).max(1);
+    let concurrency = total_accounts.clamp(1, 10);
 
-    let results: Vec<(String, bool)> = stream::iter(store.accounts.into_iter())
+    let results: Vec<(String, bool)> = stream::iter(store.accounts)
         .map(|account| async move {
             let account_id = account.id.clone();
             let failed = send_warmup(&account).await.is_err();
