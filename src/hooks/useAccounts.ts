@@ -53,7 +53,13 @@ export function useAccounts() {
           await worker(items[current]);
         }
       });
-      await Promise.allSettled(runners);
+      const results = await Promise.allSettled(runners);
+      const failed = results.find(
+        (result): result is PromiseRejectedResult => result.status === "rejected"
+      );
+      if (failed) {
+        throw failed.reason;
+      }
     },
     []
   );
@@ -222,13 +228,30 @@ export function useAccounts() {
   }, []);
 
   const switchAccount = useCallback(
-    async (accountId: string) => {
+    async (accountId: string, options?: { force?: boolean }) => {
       try {
-        await invokeBackend("switch_account", { accountId });
+        await invokeBackend("switch_account", {
+          accountId,
+          force: options?.force ?? false,
+        });
         await loadAccounts(true); // Preserve usage data
       } catch (err) {
         throw err;
       }
+    },
+    [loadAccounts]
+  );
+
+  const autoSwitchAccountForUsage = useCallback(
+    async (usages: UsageInfo[]) => {
+      const switched = await invokeBackend<AccountInfo | null>(
+        "auto_switch_account_for_usage",
+        { usages }
+      );
+      if (switched) {
+        await loadAccounts(true);
+      }
+      return switched;
     },
     [loadAccounts]
   );
@@ -326,9 +349,12 @@ export function useAccounts() {
   );
 
   const exportAccountsFullEncryptedFile = useCallback(
-    async (path: string) => {
+    async (path: string, passphrase: string) => {
       try {
-        await invokeBackend("export_accounts_full_encrypted_file", { path });
+        await invokeBackend("export_accounts_full_encrypted_file", {
+          path,
+          passphrase,
+        });
       } catch (err) {
         throw err;
       }
@@ -337,11 +363,11 @@ export function useAccounts() {
   );
 
   const importAccountsFullEncryptedFile = useCallback(
-    async (path: string) => {
+    async (path: string, passphrase: string) => {
       try {
         const summary = await invokeBackend<ImportAccountsSummary>(
           "import_accounts_full_encrypted_file",
-          { path }
+          { path, passphrase }
         );
         const accountList = await loadAccounts();
         await refreshUsage(accountList);
@@ -399,6 +425,7 @@ export function useAccounts() {
     warmupAccount,
     warmupAllAccounts,
     switchAccount,
+    autoSwitchAccountForUsage,
     deleteAccount,
     renameAccount,
     importFromFile,

@@ -1,11 +1,15 @@
 //! Account management Tauri commands
 
 use crate::auth::{
-    add_account, create_chatgpt_account_from_refresh_token, get_active_account,
-    import_from_auth_json, import_from_auth_json_contents, load_accounts, remove_account,
-    save_accounts, set_active_account, switch_to_account, touch_account,
+    add_account, clear_codex_auth_file, create_chatgpt_account_from_refresh_token,
+    import_from_auth_json, import_from_auth_json_contents, load_accounts,
+    load_accounts_synced_with_current_auth, mutate_accounts, remove_account, set_active_account,
+    switch_to_account, touch_account,
 };
-use crate::types::{AccountInfo, AccountsStore, AuthData, ImportAccountsSummary, StoredAccount};
+use crate::commands::process::terminate_codex_processes;
+use crate::types::{
+    AccountInfo, AccountsStore, AuthData, ImportAccountsSummary, StoredAccount, UsageInfo,
+};
 
 use anyhow::Context;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -18,7 +22,7 @@ use futures::{stream, StreamExt};
 use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
 use sha2::Sha256;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 
@@ -38,11 +42,18 @@ const FULL_FILE_VERSION: u8 = 1;
 const FULL_SALT_LEN: usize = 16;
 const FULL_NONCE_LEN: usize = 24;
 const FULL_KDF_ITERATIONS: u32 = 210_000;
-const FULL_PRESET_PASSPHRASE: &str = "gT7kQ9mV2xN4pL8sR1dH6zW3cB5yF0uJ_aE7nK2tP9vM4rX1";
+const FULL_BACKUP_MIN_PASSPHRASE_CHARS: usize = 12;
 
 const MAX_IMPORT_JSON_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_IMPORT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const SLIM_IMPORT_CONCURRENCY: usize = 6;
+const AUTO_SWITCH_USED_PERCENT: f64 = 99.0;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AutoSwitchPlan {
+    account_id: String,
+    reload_codex_sessions: bool,
+}
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct SlimPayload {
@@ -69,7 +80,7 @@ struct SlimAccountPayload {
 /// List all accounts with their info
 #[tauri::command]
 pub async fn list_accounts() -> Result<Vec<AccountInfo>, String> {
-    let store = load_accounts().map_err(|e| e.to_string())?;
+    let store = load_accounts_synced_with_current_auth().map_err(|e| e.to_string())?;
     let active_id = store.active_account_id.as_deref();
 
     let accounts: Vec<AccountInfo> = store
@@ -84,11 +95,11 @@ pub async fn list_accounts() -> Result<Vec<AccountInfo>, String> {
 /// Get the currently active account
 #[tauri::command]
 pub async fn get_active_account_info() -> Result<Option<AccountInfo>, String> {
-    let store = load_accounts().map_err(|e| e.to_string())?;
+    let store = load_accounts_synced_with_current_auth().map_err(|e| e.to_string())?;
     let active_id = store.active_account_id.as_deref();
 
-    if let Some(active) = get_active_account().map_err(|e| e.to_string())? {
-        Ok(Some(AccountInfo::from_stored(&active, active_id)))
+    if let Some(active) = active_id.and_then(|id| store.accounts.iter().find(|a| a.id == id)) {
+        Ok(Some(AccountInfo::from_stored(active, active_id)))
     } else {
         Ok(None)
     }
@@ -99,6 +110,7 @@ pub async fn get_active_account_info() -> Result<Option<AccountInfo>, String> {
 pub async fn add_account_from_file(path: String, name: String) -> Result<AccountInfo, String> {
     // Import from the file
     let account = import_from_auth_json(&path, name).map_err(|e| e.to_string())?;
+    load_accounts_synced_with_current_auth().map_err(|e| e.to_string())?;
 
     // Add to storage
     let stored = add_account(account).map_err(|e| e.to_string())?;
@@ -115,6 +127,7 @@ pub async fn add_account_from_auth_json_text(
     contents: String,
 ) -> Result<AccountInfo, String> {
     let account = import_from_auth_json_contents(&contents, name).map_err(|e| e.to_string())?;
+    load_accounts_synced_with_current_auth().map_err(|e| e.to_string())?;
     let stored = add_account(account).map_err(|e| e.to_string())?;
 
     let store = load_accounts().map_err(|e| e.to_string())?;
@@ -125,8 +138,9 @@ pub async fn add_account_from_auth_json_text(
 
 /// Switch to a different account
 #[tauri::command]
-pub async fn switch_account(account_id: String) -> Result<(), String> {
-    let store = load_accounts().map_err(|e| e.to_string())?;
+pub async fn switch_account(account_id: String, force: Option<bool>) -> Result<(), String> {
+    let force = force.unwrap_or(false);
+    let store = load_accounts_synced_with_current_auth().map_err(|e| e.to_string())?;
 
     // Find the account
     let account = store
@@ -144,8 +158,53 @@ pub async fn switch_account(account_id: String) -> Result<(), String> {
     // Update last_used_at
     touch_account(&account_id).map_err(|e| e.to_string())?;
 
-    // Restart Antigravity background process if it is running
-    // This allows it to pick up the new authorization file seamlessly
+    if force {
+        reload_consumers_after_account_switch().map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+/// Automatically switch away from the active account when supplied usage data
+/// shows it is exhausted, then reload running Codex consumers so they stop
+/// using credentials from the exhausted account.
+#[tauri::command]
+pub async fn auto_switch_account_for_usage(
+    usages: Vec<UsageInfo>,
+) -> Result<Option<AccountInfo>, String> {
+    let store = load_accounts_synced_with_current_auth().map_err(|e| e.to_string())?;
+    let active_id = store.active_account_id.as_deref();
+    let Some(plan) = auto_switch_plan_for_usage(&store.accounts, active_id, &usages) else {
+        return Ok(None);
+    };
+    let candidate_id = plan.account_id.clone();
+
+    let account = store
+        .accounts
+        .iter()
+        .find(|account| account.id == candidate_id)
+        .ok_or_else(|| format!("Account not found: {candidate_id}"))?;
+
+    switch_to_account(account).map_err(|e| e.to_string())?;
+    set_active_account(&candidate_id).map_err(|e| e.to_string())?;
+    touch_account(&candidate_id).map_err(|e| e.to_string())?;
+
+    if plan.reload_codex_sessions {
+        reload_consumers_after_account_switch().map_err(|e| e.to_string())?;
+    }
+
+    let updated_store = load_accounts_synced_with_current_auth().map_err(|e| e.to_string())?;
+    let active_id = updated_store.active_account_id.as_deref();
+    Ok(updated_store
+        .accounts
+        .iter()
+        .find(|account| account.id == candidate_id)
+        .map(|account| AccountInfo::from_stored(account, active_id)))
+}
+
+fn reload_consumers_after_account_switch() -> anyhow::Result<()> {
+    terminate_codex_processes()?;
+
     if let Ok(pids) = find_antigravity_processes() {
         for pid in pids {
             #[cfg(unix)]
@@ -167,10 +226,113 @@ pub async fn switch_account(account_id: String) -> Result<(), String> {
     Ok(())
 }
 
+fn auto_switch_plan_for_usage(
+    accounts: &[StoredAccount],
+    active_account_id: Option<&str>,
+    usages: &[UsageInfo],
+) -> Option<AutoSwitchPlan> {
+    select_auto_switch_account_id(accounts, active_account_id, usages).map(|account_id| {
+        AutoSwitchPlan {
+            account_id,
+            reload_codex_sessions: true,
+        }
+    })
+}
+
+fn select_auto_switch_account_id(
+    accounts: &[StoredAccount],
+    active_account_id: Option<&str>,
+    usages: &[UsageInfo],
+) -> Option<String> {
+    let active_account_id = active_account_id?;
+    let usage_by_account_id: HashMap<&str, &UsageInfo> = usages
+        .iter()
+        .map(|usage| (usage.account_id.as_str(), usage))
+        .collect();
+    let active_usage = usage_by_account_id.get(active_account_id)?;
+
+    if !usage_is_exhausted(active_usage) {
+        return None;
+    }
+
+    accounts
+        .iter()
+        .filter(|account| account.id != active_account_id)
+        .filter_map(|account| {
+            let usage = usage_by_account_id.get(account.id.as_str())?;
+            usage_is_available(usage).then_some((account, usage))
+        })
+        .max_by(|(_, a_usage), (_, b_usage)| {
+            usage_score(a_usage)
+                .partial_cmp(&usage_score(b_usage))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(account, _)| account.id.clone())
+}
+
+fn usage_is_exhausted(usage: &UsageInfo) -> bool {
+    if usage.error.as_deref().is_some_and(is_rate_limit_error) {
+        return true;
+    }
+
+    if usage.has_credits == Some(false) && usage.unlimited_credits != Some(true) {
+        return true;
+    }
+
+    usage.primary_used_percent.is_some_and(is_limit_exhausted)
+        || usage.secondary_used_percent.is_some_and(is_limit_exhausted)
+}
+
+fn usage_is_available(usage: &UsageInfo) -> bool {
+    if usage.error.is_some() {
+        return false;
+    }
+
+    if usage.has_credits == Some(false) && usage.unlimited_credits != Some(true) {
+        return false;
+    }
+
+    !usage.primary_used_percent.is_some_and(is_limit_exhausted)
+        && !usage.secondary_used_percent.is_some_and(is_limit_exhausted)
+        && (usage.primary_used_percent.is_some() || usage.secondary_used_percent.is_some())
+}
+
+fn is_limit_exhausted(used_percent: f64) -> bool {
+    used_percent >= AUTO_SWITCH_USED_PERCENT
+}
+
+fn is_rate_limit_error(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("429")
+        || normalized.contains("rate limit")
+        || normalized.contains("usage limit")
+}
+
+fn usage_score(usage: &UsageInfo) -> f64 {
+    let primary_remaining = usage
+        .primary_used_percent
+        .map(|used| (100.0 - used).max(0.0))
+        .unwrap_or(0.0);
+    let secondary_remaining = usage
+        .secondary_used_percent
+        .map(|used| (100.0 - used).max(0.0))
+        .unwrap_or(0.0);
+
+    primary_remaining * 10.0 + secondary_remaining
+}
+
 /// Remove an account
 #[tauri::command]
 pub async fn delete_account(account_id: String) -> Result<(), String> {
-    remove_account(&account_id).map_err(|e| e.to_string())?;
+    let result = remove_account(&account_id).map_err(|e| e.to_string())?;
+    if result.removed_was_active {
+        if let Some(account) = result.replacement_active_account {
+            switch_to_account(&account).map_err(|e| e.to_string())?;
+            touch_account(&account.id).map_err(|e| e.to_string())?;
+        } else {
+            clear_codex_auth_file().map_err(|e| e.to_string())?;
+        }
+    }
     Ok(())
 }
 
@@ -186,7 +348,7 @@ pub async fn rename_account(account_id: String, new_name: String) -> Result<(), 
 /// For ChatGPT accounts, only refresh token is exported.
 #[tauri::command]
 pub async fn export_accounts_slim_text() -> Result<String, String> {
-    let store = load_accounts().map_err(|e| e.to_string())?;
+    let store = load_accounts_synced_with_current_auth().map_err(|e| e.to_string())?;
     encode_slim_payload_from_store(&store).map_err(|e| e.to_string())
 }
 
@@ -196,7 +358,7 @@ pub async fn import_accounts_slim_text(payload: String) -> Result<ImportAccounts
     let slim_payload = decode_slim_payload(&payload).map_err(|e| format!("{e:#}"))?;
     let total_in_payload = slim_payload.accounts.len();
 
-    let current = load_accounts().map_err(|e| e.to_string())?;
+    let current = load_accounts_synced_with_current_auth().map_err(|e| e.to_string())?;
     let existing_names: HashSet<String> = current.accounts.iter().map(|a| a.name.clone()).collect();
 
     let imported = build_store_from_slim_payload(slim_payload, &existing_names)
@@ -208,8 +370,12 @@ pub async fn import_accounts_slim_text(payload: String) -> Result<ImportAccounts
         })?;
     validate_imported_store(&imported).map_err(|e| format!("{e:#}"))?;
 
-    let (merged, summary) = merge_accounts_store(current, imported);
-    save_accounts(&merged).map_err(|e| e.to_string())?;
+    let summary = mutate_accounts(|current| {
+        let (merged, summary) = merge_accounts_store(current.clone(), imported);
+        *current = merged;
+        Ok(summary)
+    })
+    .map_err(|e| e.to_string())?;
     Ok(ImportAccountsSummary {
         total_in_payload,
         imported_count: summary.imported_count,
@@ -219,48 +385,55 @@ pub async fn import_accounts_slim_text(payload: String) -> Result<ImportAccounts
 
 /// Export full account config as an encrypted file.
 #[tauri::command]
-pub async fn export_accounts_full_encrypted_file(path: String) -> Result<(), String> {
-    let store = load_accounts().map_err(|e| e.to_string())?;
-    let encrypted =
-        encode_full_encrypted_store(&store, FULL_PRESET_PASSPHRASE).map_err(|e| e.to_string())?;
+pub async fn export_accounts_full_encrypted_file(
+    path: String,
+    passphrase: String,
+) -> Result<(), String> {
+    let store = load_accounts_synced_with_current_auth().map_err(|e| e.to_string())?;
+    let encrypted = encode_full_encrypted_store(&store, &passphrase).map_err(|e| e.to_string())?;
     write_encrypted_file(&path, &encrypted).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 /// Export full account config as encrypted bytes for browser clients.
-pub async fn export_accounts_full_encrypted_bytes() -> Result<Vec<u8>, String> {
-    let store = load_accounts().map_err(|e| e.to_string())?;
-    encode_full_encrypted_store(&store, FULL_PRESET_PASSPHRASE).map_err(|e| e.to_string())
+pub async fn export_accounts_full_encrypted_bytes(passphrase: String) -> Result<Vec<u8>, String> {
+    let store = load_accounts_synced_with_current_auth().map_err(|e| e.to_string())?;
+    encode_full_encrypted_store(&store, &passphrase).map_err(|e| e.to_string())
 }
 
 /// Import full account config from an encrypted file, skipping existing accounts.
 #[tauri::command]
 pub async fn import_accounts_full_encrypted_file(
     path: String,
+    passphrase: String,
 ) -> Result<ImportAccountsSummary, String> {
     let encrypted = read_encrypted_file(&path).map_err(|e| e.to_string())?;
-    let imported = decode_full_encrypted_store(&encrypted, FULL_PRESET_PASSPHRASE)
-        .map_err(|e| e.to_string())?;
+    let imported =
+        decode_full_encrypted_store(&encrypted, &passphrase).map_err(|e| e.to_string())?;
     validate_imported_store(&imported).map_err(|e| e.to_string())?;
 
-    let current = load_accounts().map_err(|e| e.to_string())?;
-    let (merged, summary) = merge_accounts_store(current, imported);
-    save_accounts(&merged).map_err(|e| e.to_string())?;
-    Ok(summary)
+    mutate_accounts(|current| {
+        let (merged, summary) = merge_accounts_store(current.clone(), imported);
+        *current = merged;
+        Ok(summary)
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// Import full account config from encrypted bytes uploaded through the browser UI.
 pub async fn import_accounts_full_encrypted_bytes(
     bytes: Vec<u8>,
+    passphrase: String,
 ) -> Result<ImportAccountsSummary, String> {
-    let imported =
-        decode_full_encrypted_store(&bytes, FULL_PRESET_PASSPHRASE).map_err(|e| e.to_string())?;
+    let imported = decode_full_encrypted_store(&bytes, &passphrase).map_err(|e| e.to_string())?;
     validate_imported_store(&imported).map_err(|e| e.to_string())?;
 
-    let current = load_accounts().map_err(|e| e.to_string())?;
-    let (merged, summary) = merge_accounts_store(current, imported);
-    save_accounts(&merged).map_err(|e| e.to_string())?;
-    Ok(summary)
+    mutate_accounts(|current| {
+        let (merged, summary) = merge_accounts_store(current.clone(), imported);
+        *current = merged;
+        Ok(summary)
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// Find all running Antigravity codex assistant processes
@@ -419,7 +592,7 @@ fn validate_slim_payload(payload: &SlimPayload) -> anyhow::Result<()> {
                 if account
                     .api_key
                     .as_ref()
-                    .map_or(true, |key| key.trim().is_empty())
+                    .is_none_or(|key| key.trim().is_empty())
                 {
                     anyhow::bail!("API key is missing for account {}", account.name);
                 }
@@ -428,7 +601,7 @@ fn validate_slim_payload(payload: &SlimPayload) -> anyhow::Result<()> {
                 if account
                     .refresh_token
                     .as_ref()
-                    .map_or(true, |token| token.trim().is_empty())
+                    .is_none_or(|token| token.trim().is_empty())
                 {
                     anyhow::bail!("Refresh token is missing for account {}", account.name);
                 }
@@ -526,6 +699,7 @@ async fn restore_slim_accounts(
 }
 
 fn encode_full_encrypted_store(store: &AccountsStore, passphrase: &str) -> anyhow::Result<Vec<u8>> {
+    let passphrase = validate_full_backup_passphrase(passphrase)?;
     let json = serde_json::to_vec(store).context("Failed to serialize account store")?;
     let compressed = compress_bytes(&json).context("Failed to compress account store")?;
 
@@ -555,6 +729,7 @@ fn decode_full_encrypted_store(
     file_bytes: &[u8],
     passphrase: &str,
 ) -> anyhow::Result<AccountsStore> {
+    let passphrase = validate_full_backup_passphrase(passphrase)?;
     if file_bytes.len() as u64 > MAX_IMPORT_FILE_BYTES {
         anyhow::bail!("Encrypted file is too large");
     }
@@ -596,6 +771,17 @@ fn decode_full_encrypted_store(
         serde_json::from_slice(&json).context("Failed to parse decrypted account payload")?;
 
     Ok(store)
+}
+
+fn validate_full_backup_passphrase(passphrase: &str) -> anyhow::Result<&str> {
+    let normalized = passphrase.trim();
+    if normalized.chars().count() < FULL_BACKUP_MIN_PASSPHRASE_CHARS {
+        anyhow::bail!(
+            "Full backup passphrase must be at least {FULL_BACKUP_MIN_PASSPHRASE_CHARS} characters"
+        );
+    }
+
+    Ok(normalized)
 }
 
 fn derive_encryption_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
@@ -735,4 +921,140 @@ pub async fn get_masked_account_ids() -> Result<Vec<String>, String> {
 #[tauri::command]
 pub async fn set_masked_account_ids(ids: Vec<String>) -> Result<(), String> {
     crate::auth::storage::set_masked_account_ids(ids).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_auto_switch_account_id;
+    use super::{
+        auto_switch_plan_for_usage, decode_full_encrypted_store, encode_full_encrypted_store,
+        validate_full_backup_passphrase,
+    };
+    use crate::types::{AccountsStore, StoredAccount, UsageInfo};
+
+    fn account(name: &str) -> StoredAccount {
+        StoredAccount::new_chatgpt(
+            name.to_string(),
+            Some(format!("{name}@example.com")),
+            Some("plus".to_string()),
+            None,
+            format!("{name}-id-token"),
+            format!("{name}-access"),
+            format!("{name}-refresh"),
+            Some(format!("acct_{name}")),
+        )
+    }
+
+    fn usage(account_id: &str, primary: f64, secondary: f64) -> UsageInfo {
+        UsageInfo {
+            account_id: account_id.to_string(),
+            plan_type: Some("plus".to_string()),
+            primary_used_percent: Some(primary),
+            primary_window_minutes: Some(300),
+            primary_resets_at: Some(1_800_000_000),
+            secondary_used_percent: Some(secondary),
+            secondary_window_minutes: Some(10_080),
+            secondary_resets_at: Some(1_800_086_400),
+            has_credits: Some(true),
+            unlimited_credits: Some(false),
+            credits_balance: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn auto_switch_selects_best_available_account_when_active_is_exhausted() {
+        let active = account("active");
+        let nearly_full = account("nearly_full");
+        let best = account("best");
+        let store = AccountsStore {
+            version: 1,
+            accounts: vec![active.clone(), nearly_full.clone(), best.clone()],
+            active_account_id: Some(active.id.clone()),
+            masked_account_ids: Vec::new(),
+        };
+        let usages = vec![
+            usage(&active.id, 100.0, 20.0),
+            usage(&nearly_full.id, 92.0, 10.0),
+            usage(&best.id, 35.0, 8.0),
+        ];
+
+        assert_eq!(
+            select_auto_switch_account_id(
+                &store.accounts,
+                store.active_account_id.as_deref(),
+                &usages
+            ),
+            Some(best.id)
+        );
+    }
+
+    #[test]
+    fn auto_switch_does_not_switch_before_active_is_exhausted() {
+        let active = account("active");
+        let best = account("best");
+        let store = AccountsStore {
+            version: 1,
+            accounts: vec![active.clone(), best],
+            active_account_id: Some(active.id.clone()),
+            masked_account_ids: Vec::new(),
+        };
+        let usages = vec![usage(&active.id, 80.0, 20.0)];
+
+        assert_eq!(
+            select_auto_switch_account_id(
+                &store.accounts,
+                store.active_account_id.as_deref(),
+                &usages
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn auto_switch_plan_reloads_running_codex_sessions() {
+        let active = account("active");
+        let best = account("best");
+        let store = AccountsStore {
+            version: 1,
+            accounts: vec![active.clone(), best.clone()],
+            active_account_id: Some(active.id.clone()),
+            masked_account_ids: Vec::new(),
+        };
+        let usages = vec![usage(&active.id, 100.0, 20.0), usage(&best.id, 20.0, 10.0)];
+
+        let plan = auto_switch_plan_for_usage(
+            &store.accounts,
+            store.active_account_id.as_deref(),
+            &usages,
+        )
+        .expect("active account is exhausted and a replacement exists");
+
+        assert_eq!(plan.account_id, best.id);
+        assert!(plan.reload_codex_sessions);
+    }
+
+    #[test]
+    fn full_backup_rejects_short_passphrase() {
+        assert!(validate_full_backup_passphrase("").is_err());
+        assert!(validate_full_backup_passphrase("too-short").is_err());
+    }
+
+    #[test]
+    fn full_backup_round_trips_with_user_passphrase() {
+        let account = account("backup");
+        let store = AccountsStore {
+            version: 1,
+            accounts: vec![account.clone()],
+            active_account_id: Some(account.id.clone()),
+            masked_account_ids: Vec::new(),
+        };
+        let passphrase = "correct horse battery staple";
+
+        let encrypted = encode_full_encrypted_store(&store, passphrase).expect("backup encrypts");
+        let decoded = decode_full_encrypted_store(&encrypted, passphrase).expect("backup decrypts");
+
+        assert_eq!(decoded.accounts.len(), 1);
+        assert_eq!(decoded.active_account_id, Some(account.id));
+    }
 }

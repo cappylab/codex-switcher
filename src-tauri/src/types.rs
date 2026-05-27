@@ -71,6 +71,7 @@ impl StoredAccount {
     }
 
     /// Create a new account with ChatGPT OAuth authentication
+    #[allow(clippy::too_many_arguments)]
     pub fn new_chatgpt(
         name: String,
         email: Option<String>,
@@ -242,7 +243,6 @@ impl AccountInfo {
             plan_type: account.plan_type.clone(),
             subscription_expires_at: account
                 .subscription_expires_at
-                .clone()
                 .or(fallback_subscription_expires_at),
             auth_mode: account.auth_mode,
             is_active: active_id == Some(&account.id),

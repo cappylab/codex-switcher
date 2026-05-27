@@ -6,6 +6,7 @@ import {
   pickAuthJsonFile,
   type FileSource,
 } from "../lib/platform";
+import { CloseIcon } from "./Icons";
 
 interface AddAccountModalProps {
   isOpen: boolean;
@@ -111,21 +112,22 @@ export function AddAccountModal({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
-      <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-2xl w-full max-w-md mx-4 shadow-xl">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4">
+      <div className="w-full max-w-md overflow-hidden rounded-lg border border-stone-200 bg-white shadow-xl dark:border-stone-800 dark:bg-stone-950">
         {/* Header */}
-        <div className="flex items-center justify-between p-5 border-b border-gray-100 dark:border-gray-800">
-          <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100">Add Account</h2>
+        <div className="flex items-center justify-between border-b border-stone-100 p-5 dark:border-stone-800">
+          <h2 className="text-lg font-semibold text-stone-950 dark:text-stone-50">Add Account</h2>
           <button
             onClick={handleClose}
-            className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors"
+            className="flex h-8 w-8 items-center justify-center rounded-md text-stone-400 transition-colors hover:bg-stone-100 hover:text-stone-700 dark:text-stone-500 dark:hover:bg-stone-900 dark:hover:text-stone-200"
+            title="Close"
           >
-            ✕
+            <CloseIcon />
           </button>
         </div>
 
         {/* Tabs */}
-        <div className="flex border-b border-gray-100 dark:border-gray-800">
+        <div className="flex border-b border-stone-100 dark:border-stone-800">
           {(["oauth", "import"] as Tab[]).map((tab) => (
             <button
               key={tab}
@@ -141,8 +143,8 @@ export function AddAccountModal({
                 setError(null);
               }}
               className={`flex-1 px-4 py-3 text-sm font-medium transition-colors ${activeTab === tab
-                  ? "text-gray-900 dark:text-gray-100 border-b-2 border-gray-900 dark:border-gray-100 -mb-px"
-                  : "text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300"
+                  ? "-mb-px border-b-2 border-stone-950 text-stone-950 dark:border-stone-100 dark:text-stone-100"
+                  : "text-stone-400 hover:text-stone-700 dark:text-stone-500 dark:hover:text-stone-300"
                 }`}
             >
               {tab === "oauth" ? "ChatGPT Login" : "Import File"}
@@ -154,7 +156,7 @@ export function AddAccountModal({
         <div className="p-5 space-y-4">
           {/* Account Name (always shown) */}
           <div>
-            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+            <label className="mb-2 block text-sm font-medium text-stone-700 dark:text-stone-300">
               Account Name
             </label>
             <input
@@ -162,26 +164,26 @@ export function AddAccountModal({
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="e.g., Work Account"
-              className="w-full px-4 py-2.5 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:border-gray-400 dark:focus:border-gray-500 focus:ring-1 focus:ring-gray-400 dark:focus:ring-gray-500 transition-colors"
+              className="w-full rounded-lg border border-stone-200 bg-white px-4 py-2.5 text-stone-950 outline-none transition-colors placeholder-stone-400 focus:border-stone-400 focus:ring-2 focus:ring-stone-200 dark:border-stone-800 dark:bg-stone-900 dark:text-stone-100 dark:placeholder-stone-500 dark:focus:border-stone-600 dark:focus:ring-stone-800"
             />
           </div>
 
           {/* Tab-specific content */}
           {activeTab === "oauth" && (
-            <div className="text-sm text-gray-500 dark:text-gray-400">
+            <div className="text-sm text-stone-500 dark:text-stone-400">
               {oauthPending ? (
-                <div className="text-center py-4">
-                  <div className="animate-spin h-8 w-8 border-2 border-gray-900 dark:border-gray-100 border-t-transparent rounded-full mx-auto mb-3"></div>
-                  <p className="text-gray-700 dark:text-gray-300 font-medium mb-2">Waiting for browser login...</p>
-                  <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
+                <div className="py-4 text-center">
+                  <div className="mx-auto mb-3 h-8 w-8 animate-spin rounded-full border-2 border-stone-950 border-t-transparent dark:border-stone-100 dark:border-t-transparent"></div>
+                  <p className="mb-2 font-medium text-stone-700 dark:text-stone-300">Waiting for browser login...</p>
+                  <p className="mb-4 text-xs text-stone-500 dark:text-stone-400">
                     Please open the following link in your browser to proceed:
                   </p>
-                  <div className="flex items-center gap-2 mb-2 bg-gray-50 dark:bg-gray-800 p-2 rounded-lg border border-gray-200 dark:border-gray-700">
+                  <div className="mb-2 flex items-center gap-2 rounded-lg border border-stone-200 bg-stone-50 p-2 dark:border-stone-800 dark:bg-stone-900">
                     <input
                       type="text"
                       readOnly
                       value={authUrl}
-                      className="flex-1 bg-transparent border-none text-xs text-gray-600 dark:text-gray-300 focus:outline-none focus:ring-0 truncate"
+                      className="flex-1 truncate border-none bg-transparent text-xs text-stone-600 outline-none focus:ring-0 dark:text-stone-300"
                     />
                     <button
                       onClick={() => {
@@ -195,10 +197,10 @@ export function AddAccountModal({
                             setError("Clipboard unavailable. Copy the link manually.");
                           });
                       }}
-                      className={`px-3 py-1.5 border rounded text-xs font-medium transition-colors shrink-0 
+                      className={`px-3 py-1.5 border rounded text-xs font-medium transition-colors shrink-0
                         ${copied
                           ? "bg-green-50 dark:bg-green-900/30 border-green-200 dark:border-green-700 text-green-700 dark:text-green-300"
-                          : "bg-white dark:bg-gray-900 border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-800"
+                          : "border-stone-200 bg-white text-stone-700 hover:bg-stone-50 dark:border-stone-800 dark:bg-stone-950 dark:text-stone-200 dark:hover:bg-stone-900"
                         }`}
                     >
                       {copied ? "Copied!" : "Copy"}
@@ -207,7 +209,7 @@ export function AddAccountModal({
                       onClick={() => {
                         void openExternalUrl(authUrl);
                       }}
-                      className="px-3 py-1.5 bg-gray-900 hover:bg-gray-800 dark:bg-gray-100 dark:hover:bg-gray-200 border border-gray-900 dark:border-gray-100 rounded text-xs font-medium text-white dark:text-gray-900 transition-colors shrink-0"
+                      className="shrink-0 rounded border border-stone-950 bg-stone-950 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-stone-800 dark:border-stone-100 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-white"
                     >
                       Open
                     </button>
@@ -230,21 +232,21 @@ export function AddAccountModal({
 
           {activeTab === "import" && (
             <div>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+              <label className="mb-2 block text-sm font-medium text-stone-700 dark:text-stone-300">
                 Select auth.json file
               </label>
               <div className="flex gap-2">
-                <div className="flex-1 px-4 py-2.5 bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg text-sm text-gray-600 dark:text-gray-300 truncate">
+                <div className="flex-1 truncate rounded-lg border border-stone-200 bg-stone-50 px-4 py-2.5 text-sm text-stone-600 dark:border-stone-800 dark:bg-stone-900 dark:text-stone-300">
                   {describeFileSource(fileSource)}
                 </div>
                 <button
                   onClick={handleSelectFile}
-                  className="px-4 py-2.5 bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 border border-gray-200 dark:border-gray-700 rounded-lg text-sm font-medium text-gray-700 dark:text-gray-200 transition-colors whitespace-nowrap"
+                  className="whitespace-nowrap rounded-lg border border-stone-200 bg-stone-100 px-4 py-2.5 text-sm font-medium text-stone-700 transition-colors hover:bg-stone-200 dark:border-stone-800 dark:bg-stone-900 dark:text-stone-200 dark:hover:bg-stone-800"
                 >
                   Browse...
                 </button>
               </div>
-              <p className="text-xs text-gray-400 dark:text-gray-500 mt-2">
+              <p className="mt-2 text-xs text-stone-400 dark:text-stone-500">
                 Import credentials from an existing Codex auth.json file
               </p>
             </div>
@@ -259,17 +261,17 @@ export function AddAccountModal({
         </div>
 
         {/* Footer */}
-        <div className="flex gap-3 p-5 border-t border-gray-100 dark:border-gray-800">
+        <div className="flex gap-3 border-t border-stone-100 p-5 dark:border-stone-800">
           <button
             onClick={handleClose}
-            className="flex-1 px-4 py-2.5 text-sm font-medium rounded-lg bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-200 transition-colors"
+            className="flex-1 rounded-md bg-stone-100 px-4 py-2.5 text-sm font-medium text-stone-700 transition-colors hover:bg-stone-200 dark:bg-stone-900 dark:text-stone-200 dark:hover:bg-stone-800"
           >
             Cancel
           </button>
           <button
             onClick={activeTab === "oauth" ? handleOAuthLogin : handleImportFile}
             disabled={isPrimaryDisabled}
-            className="flex-1 px-4 py-2.5 text-sm font-medium rounded-lg bg-gray-900 hover:bg-gray-800 dark:bg-gray-100 dark:hover:bg-gray-200 text-white dark:text-gray-900 transition-colors disabled:opacity-50"
+            className="flex-1 rounded-md bg-stone-950 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-stone-800 disabled:opacity-50 dark:bg-stone-100 dark:text-stone-950 dark:hover:bg-white"
           >
             {loading
               ? "Adding..."
